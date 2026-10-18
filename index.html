@@ -1,0 +1,272 @@
+
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import threading
+import webbrowser
+
+HOST = "127.0.0.1"
+PORT = 8000
+
+HTML = r'''<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ultimate Card Forge Online</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#101225;color:#fff;font-family:Arial,Tahoma,sans-serif}
+header{background:#202344;padding:18px;text-align:center;border-bottom:2px solid #8055ff}
+h1{font-size:23px;color:#d8c3ff;margin:0}
+main{max-width:700px;margin:auto;padding:14px}
+.panel{background:#202344;border:1px solid #454970;border-radius:15px;padding:15px;margin:12px 0}
+input,button{width:100%;padding:13px;border-radius:10px;margin-top:9px;font-size:15px}
+input{background:#101225;color:white;border:1px solid #54577e}
+button{background:#7548ef;color:white;border:0;font-weight:bold}
+button:disabled{opacity:.45}
+.secondary{background:#383b5d}
+.gold{background:#d8a932;color:#241800}
+.muted{color:#c0c3df;font-size:13px;line-height:1.8}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.card{background:#30264d;border:2px solid #a77aff;border-radius:12px;padding:15px;text-align:center;cursor:pointer}
+.card b{display:block;font-size:30px;margin:8px}
+.card.selected{border-color:#ffe27a;background:#51401e}
+#game{display:none}
+#status{white-space:pre-line;line-height:2}
+#roomcode{font-size:28px;color:#ffe27a;letter-spacing:4px;text-align:center}
+</style>
+</head>
+<body>
+<header>
+<h1>⚔️ Ultimate Card Forge</h1>
+<div class="muted">ONLINE CARD BATTLE</div>
+</header>
+<main>
+<div class="panel" id="setup">
+<h2>🎮 ورود به بازی</h2>
+<p class="muted">برای شروع، Firebase را تنظیم کن. بعد می‌توانی اتاق بسازی یا با کد وارد اتاق دوستت شوی.</p>
+<label>نام بازیکن</label>
+<input id="nickname" maxlength="24" placeholder="نام بازیکنت">
+<button onclick="connectFirebase()">اتصال به سرور آنلاین</button>
+<div id="connection" class="muted">هنوز متصل نشده‌ای.</div>
+<div id="roomControls" style="display:none">
+<hr>
+<button onclick="createRoom()">➕ ساخت اتاق جدید</button>
+<input id="joinCode" maxlength="5" placeholder="کد اتاق، مثلاً A7K2P">
+<button class="secondary" onclick="joinRoom()">ورود به اتاق دوست</button>
+</div>
+</div>
+
+<div class="panel" id="lobby" style="display:none">
+<h2>🏠 اتاق آنلاین</h2>
+<div id="roomcode"></div>
+<div id="players" class="muted"></div>
+<div id="lobbyStatus" class="muted">در انتظار بازیکن دوم...</div>
+<button id="startButton" onclick="startBattle()" disabled>شروع مسابقه</button>
+<button class="secondary" onclick="leaveRoom()">خروج از اتاق</button>
+</div>
+
+<div class="panel" id="game">
+<h2>🃏 انتخاب کارت</h2>
+<div id="gameStatus" class="muted"></div>
+<div class="grid" id="cards"></div>
+<div id="battleResult"></div>
+<button class="gold" onclick="newRound()">دور بعدی</button>
+</div>
+</main>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script>
+/*
+  مرحله اول: Firebase Console را باز کن.
+  Project settings > Your apps > Web app
+  اطلاعات config خودت را در پایین وارد کن.
+*/
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+  projectId: "YOUR_PROJECT",
+  appId: "YOUR_APP_ID"
+};
+
+let db=null, uid=null, roomCode=null, roomRef=null;
+let roomData=null, selectedPower=null, unsubscribe=null;
+const myCards=[
+ {name:"Shadow Knight",power:100,symbol:"🌑"},
+ {name:"Flame Dragon",power:250,symbol:"🐉"},
+ {name:"Cosmic Titan",power:400,symbol:"🌌"},
+ {name:"Void King",power:600,symbol:"👑"}
+];
+
+function msg(text){
+ document.getElementById("connection").textContent=text;
+}
+function cleanCode(v){return String(v||"").toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,5)}
+function makeCode(){return Math.random().toString(36).substring(2,7).toUpperCase()}
+function myName(){return document.getElementById("nickname").value.trim().slice(0,24)||"Player"}
+function connectFirebase(){
+ if(firebaseConfig.apiKey==="YOUR_API_KEY"){
+  msg("اول اطلاعات Firebase خودت را در کد وارد کن.");
+  return;
+ }
+ try{
+  if(!firebase.apps.length)firebase.initializeApp(firebaseConfig);
+  db=firebase.database();
+  firebase.auth().signInAnonymously().then(user=>{
+   uid=user.user.uid;
+   msg("✅ به Firebase متصل شدی.");
+   document.getElementById("roomControls").style.display="block";
+  }).catch(e=>msg("خطای ورود: "+e.message));
+ }catch(e){msg("خطای اتصال: "+e.message)}
+}
+async function createRoom(){
+ if(!db||!uid)return alert("اول به Firebase متصل شو.");
+ if(roomRef)await leaveRoom();
+ let code=makeCode();
+ roomRef=db.ref("rooms/"+code);
+ let data={
+  host:uid,
+  status:"waiting",
+  round:1,
+  players:{},
+  picks:{},
+  result:null
+ };
+ data.players[uid]={name:myName(),joinedAt:Date.now()};
+ try{
+  await roomRef.set(data);
+  roomCode=code;
+  watchRoom();
+ }catch(e){alert("ساخت اتاق ناموفق بود: "+e.message)}
+}
+async function joinRoom(){
+ if(!db||!uid)return alert("اول به Firebase متصل شو.");
+ let code=cleanCode(document.getElementById("joinCode").value);
+ if(code.length!==5)return alert("کد اتاق باید ۵ حرف یا عدد باشد.");
+ let ref=db.ref("rooms/"+code);
+ try{
+  let snap=await ref.get();
+  if(!snap.exists())return alert("اتاق پیدا نشد.");
+  let data=snap.val();
+  if(data.status!=="waiting")return alert("این اتاق در حال بازی است.");
+  if(Object.keys(data.players||{}).length>=2&&!data.players[uid])return alert("اتاق پر است.");
+  await ref.child("players/"+uid).set({name:myName(),joinedAt:Date.now()});
+  roomCode=code;roomRef=ref;watchRoom();
+ }catch(e){alert("ورود ناموفق بود: "+e.message)}
+}
+function watchRoom(){
+ document.getElementById("setup").style.display="none";
+ document.getElementById("lobby").style.display="block";
+ document.getElementById("roomcode").textContent=roomCode;
+ if(unsubscribe)unsubscribe();
+ const listener=snap=>{
+  roomData=snap.val();
+  if(!roomData){alert("اتاق بسته شده است.");leaveRoom();return}
+  renderRoom();
+ };
+ roomRef.on("value",listener);
+ unsubscribe=()=>roomRef.off("value",listener);
+}
+function renderRoom(){
+ if(!roomData)return;
+ let players=roomData.players||{};
+ let ids=Object.keys(players);
+ document.getElementById("players").innerHTML="بازیکنان:<br>"+
+ ids.map(id=>escapeHTML(players[id].name)+(id===roomData.host?" 👑":"")).join("<br>");
+ let ready=ids.length===2;
+ document.getElementById("startButton").disabled=!(ready&&uid===roomData.host);
+ document.getElementById("lobbyStatus").textContent=
+  ready?(uid===roomData.host?"هر دو بازیکن حاضرند؛ مسابقه را شروع کن.":"منتظر شروع مسابقه توسط میزبان..."):"در انتظار بازیکن دوم...";
+ if(roomData.status==="playing"){
+  document.getElementById("game").style.display="block";
+  renderBattle();
+ }else{
+  document.getElementById("game").style.display="none";
+ }
+}
+async function startBattle(){
+ if(!roomRef||!roomData||uid!==roomData.host)return;
+ if(Object.keys(roomData.players||{}).length!==2)return alert("برای شروع دو بازیکن لازم است.");
+ await roomRef.update({status:"playing",picks:{},result:null});
+}
+function renderBattle(){
+ let ids=Object.keys(roomData.players||{});
+ let myPick=(roomData.picks||{})[uid];
+ document.getElementById("gameStatus").textContent=
+  "اتاق "+roomCode+" | دور "+(roomData.round||1)+"\n"+
+  ids.map(id=>roomData.players[id].name+
+   ((roomData.picks||{})[id]?" — کارت انتخاب شد":" — در انتظار انتخاب")).join("\n");
+ document.getElementById("cards").innerHTML=myCards.map((c,i)=>
+  `<div class="card ${myPick&&myPick.power===c.power?"selected":""}" onclick="pickCard(${c.power})">
+  ${escapeHTML(c.name)}<b>${c.symbol}</b>قدرت: ${c.power}</div>`).join("");
+ let result=roomData.result;
+ document.getElementById("battleResult").innerHTML=result?
+  "<div class='panel'>"+escapeHTML(result.text)+"</div>":
+  "<p class='muted'>"+(myPick?"کارت انتخاب شد؛ منتظر حریف هستیم.":"یک کارت را انتخاب کن.")+"</p>";
+}
+async function pickCard(power){
+ if(!roomRef||!roomData||roomData.status!=="playing")return;
+ if((roomData.picks||{})[uid])return alert("این دور کارتت را انتخاب کرده‌ای.");
+ try{
+  await roomRef.child("picks/"+uid).set({power:power,round:roomData.round||1});
+  let snap=await roomRef.get(),data=snap.val();
+  let ids=Object.keys(data.players||{}),picks=data.picks||{};
+  if(ids.length===2&&ids.every(id=>picks[id]&&picks[id].round===(data.round||1))){
+   let a=ids[0],b=ids[1],pa=picks[a].power,pb=picks[b].power;
+   let text=pa===pb?"مساوی!":pa>pb?data.players[a].name+" این دور را برد!":data.players[b].name+" این دور را برد!";
+   await roomRef.update({result:{text:text,powers:{[a]:pa,[b]:pb}}});
+  }
+ }catch(e){alert("ثبت کارت ناموفق بود: "+e.message)}
+}
+async function newRound(){
+ if(!roomRef||!roomData||uid!==roomData.host)return alert("فقط میزبان می‌تواند دور بعد را آغاز کند.");
+ if(!roomData.result)return alert("اول هر دو بازیکن باید کارت انتخاب کنند.");
+ await roomRef.update({round:(roomData.round||1)+1,picks:{},result:null});
+}
+async function leaveRoom(){
+ if(unsubscribe){unsubscribe();unsubscribe=null}
+ roomRef=null;roomCode=null;roomData=null;
+ document.getElementById("setup").style.display="block";
+ document.getElementById("lobby").style.display="none";
+ document.getElementById("game").style.display="none";
+}
+function escapeHTML(s){
+ return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+</script>
+</body>
+</html>'''
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/index.html"):
+            self.send_error(404)
+            return
+        body = HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+def main():
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    url = f"http://{HOST}:{PORT}/"
+    print("Ultimate Card Forge Online - صفحه محلی")
+    print("مرورگر را باز کن و این نشانی را وارد کن:")
+    print(url)
+    threading.Timer(1, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+if __name__ == "__main__":
+    main()
